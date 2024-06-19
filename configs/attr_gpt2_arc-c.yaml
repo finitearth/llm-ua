@@ -1,0 +1,9 @@
+_base_: ['./ft_gpt2_arc-c.yaml']
+
+data:
+    val_split:
+        subset_size: 100
+
+visualize_cfg:
+    # whether apply absolute value conversion before averaging attribution array.
+    absolute: True

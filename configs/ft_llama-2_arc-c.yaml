@@ -1,0 +1,57 @@
+model:
+    model_name_or_path: "meta-llama/Llama-2-7b-hf"
+    kfac_path: "workdirs/ft_llama-2_arc-c/kronecker_factors.pth"
+    peft_path: "workdirs/ft_llama-2_arc-c/map_model_ckpt"
+    model_cfg:
+        type: AutoModelForCausalLM
+        torch_dtype: bfloat16
+#        attn_implementation: "flash_attention_2"
+    tokenizer_cfg:
+        type: AutoTokenizer
+        use_fast: true
+    special_tokens: {}
+    use_peft: True
+    peft_cfg:
+        type: LoraConfig
+        r: 8
+        lora_alpha: 16
+        lora_dropout: 0.1
+        task_type: "CAUSAL_LM"
+        inference_mode: false
+        bias: lora_only
+        target_modules: ["q_proj", "v_proj", "lm_head"]
+
+tokenizer_run_cfg:
+    padding: true
+    truncation: true
+    return_tensors: "pt"
+    max_length: 300
+
+data:
+    data_set:
+        type: ARCDataset
+        name: 'C'
+        add_space: False
+        few_shot: False
+    train_split:
+        split_key: train
+    val_split:
+        split_key: validation
+    data_loader:
+        batch_size: 4
+        num_workers: 4
+    is_s2s: False
+
+optimizer:
+    lr: 0.00005
+    betas: [0.9, 0.999]
+    eps: 0.00001
+    weight_decay: 0
+
+num_epochs: 36
+log_steps_interval: 20
+
+lalora:
+     n_kfac: 10
+     lr_threshold: 100
+     prior_var: 0.1

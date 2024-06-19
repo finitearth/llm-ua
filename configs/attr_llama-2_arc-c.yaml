@@ -1,0 +1,16 @@
+_base_: ['./ft_llama-2_arc-c.yaml']
+
+data:
+    val_split:
+        subset_size: 100
+
+visualize_cfg:
+    absolute: True
+
+perturbation:
+    attr_data_root: "./workdirs/attr_llama/raw_attributions/"
+    attr_layer_name: "layers.28"
+    model_layer_name: "model.model.layers.28"
+    top_k_ratio: 0.001
+    perturb_alpha: 1.0
+    verbose: False

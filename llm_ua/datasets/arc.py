@@ -60,6 +60,18 @@ class ARCDataset(ClassificationDataset):
         return prompts
 
     def clm_collate_fn(self, batch: List[Dict[str, Any]]) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+        """
+        Collates a batch of data into the required format for a choice of language model training.
+
+        Parameters:
+        - batch (List[Dict[str, Any]]): A list of dictionaries, each representing a single data point in the batch.
+
+        Returns:
+        - Tuple[List[str], torch.Tensor, torch.Tensor]: A tuple containing:
+            - `prompts`: A list of strings formatted as input prompts for the model.
+            - `classes`: A tensor of integers where each integer indicates the index of the correct answer choice.
+            - `targets`: A tensor concatenating the token IDs of the nth choice, representing the correct answer.
+        """
         prompts = self._format_prompts(batch)
         classes_alpha = torch.tensor([ord(e['answerKey']) - ord('A') for e in batch])
         classes_num = []

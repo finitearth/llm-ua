@@ -1,14 +1,14 @@
 import os.path as osp
+import re
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import mmengine
 import numpy as np
 import pandas as pd
 import torch
 from alive_progress import alive_it
-from numpy import ndarray
 from torch import nn
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizer
@@ -22,13 +22,15 @@ from .visualization import visualize
 @dataclass
 class RawResult:
     """Result obtained on single input sample. All arrays have batch dimension, and the batch size is 1."""
-    input_tokens: ndarray  # array of str, shape: (1, seq_len)
+    input_tokens: np.ndarray  # array of str, shape: (1, seq_len)
     input_prompts: List[str]  # list of str. The length is 1.
     attributions: Dict[str, np.ndarray]
     logits: np.ndarray  # shape: (1, num_classes)
     variance: np.ndarray  # shape: (1, num_classes, num_classes)
     gt_classes: np.ndarray  # shape: (1,)
     entropy: np.ndarray  # shape: (), means that it is a scalar array.
+
+    # tokenid of the correct token
 
     def to_fp16(self):
         """Convert attributions into np.float16"""
@@ -71,7 +73,8 @@ class UncertaintyAttributer:
             model: nn.Module,
             kfac_factors: Dict[str, torch.Tensor],
             target_ids: list[int],
-            device: Device):
+            device: Device,
+            retain_grad: bool = False):
         self.cfg = cfg
         self.tokenizer = tokenizer
         self.model = model
@@ -84,6 +87,7 @@ class UncertaintyAttributer:
         self.kfac_factors = kfac_factors
         self.target_ids = target_ids
         self.device = device
+        self.retain_grad = retain_grad
 
         self.prior_var = torch.tensor(cfg.lalora.prior_var, dtype=next(model.parameters()).dtype, device=device)
 
@@ -94,7 +98,7 @@ class UncertaintyAttributer:
         return logits
 
     def _on_sample_attribution_end(self, batch_idx: int, raw_result: RawResult) -> None:
-        raise NotImplementedError('This method should be implemented in the subclass.')
+        pass
 
     def _on_final(self, **kwargs: Any) -> None:
         pass
@@ -103,19 +107,36 @@ class UncertaintyAttributer:
         n_labels = len(self.target_ids)
         for batch_idx, batch in alive_it(enumerate(data_loader), total=len(data_loader)):
             prompts, classes, targets = batch
-            raw_result = self.get_attribution_of_sample(prompts, n_labels, targets)
+            raw_result = self.get_attribution_of_sample(prompts, n_labels, classes)
             self._on_sample_attribution_end(batch_idx, raw_result)
         self._on_final()
 
-    def get_attribution_of_sample(self, prompts: List[str], n_labels: int, classes: torch.Tensor) -> RawResult:
-        inputs = self.tokenizer(prompts, **self.cfg.tokenizer_run_cfg).to(self.device)
+    def get_attribution_of_sample(
+            self,
+            prompts: List[str] = None,
+            n_labels: int = None,
+            gt_classes: torch.Tensor = None,
+            inputs_embeds: torch.tensor = None,
+            convert_to_np: bool = True) -> RawResult:
+        assert (prompts is not None) or (inputs_embeds is not None), 'Either prompts or embedding should be provided.'
 
-        # TODO: currently only compatible with Peft Llama, can be wrapped to a function to consider other models.
-        input_ids = inputs.pop('input_ids')
-        assert input_ids.shape[0] == 1, 'batch_size should be 1.'
+        if inputs_embeds is None:
+            inputs = self.tokenizer(prompts, **self.cfg.tokenizer_run_cfg).to(self.device)
 
-        # this long chain (for retrieving embed layer) is due to the wrapper of PEFT and Pretrained models.
-        inputs_embeds = self.model.base_model.model.model.embed_tokens(input_ids)
+            # TODO: currently only compatible with Peft Llama, can be wrapped to a function to consider other models.
+            input_ids = inputs.pop('input_ids')
+            assert input_ids.shape[0] == 1, 'batch_size should be 1.'
+
+            # this long chain (for retrieving embed layer) is due to the wrapper of PEFT and Pretrained models.
+            inputs_embeds = self.model.base_model.model.model.embed_tokens(input_ids)
+
+            # decode the input tokens without concatenating the decoded tokens into a single string
+            # decoded_input_tokens.shape: (1, seq_len)
+            decoded_input_tokens = np.asarray(self.tokenizer.batch_decode(input_ids.unsqueeze(-1)[0]))[np.newaxis, :]
+
+        else:
+            inputs = {}
+            decoded_input_tokens = None
 
         inputs_embeds.requires_grad = True
         inputs.update({'inputs_embeds': inputs_embeds})
@@ -143,7 +164,7 @@ class UncertaintyAttributer:
             hs.retain_grad()
 
         entropy = entropy_of_gaussian(f_var).mean()
-        entropy.backward()
+        entropy.backward(retain_graph=self.retain_grad)
 
         attribution_dict = OrderedDict()
         for i, hs in enumerate(hidden_states):
@@ -151,14 +172,14 @@ class UncertaintyAttributer:
             if hs.grad is not None:
                 attribution_dict.update({attr_layer_name: hs.grad.to(torch.float32).clone().detach().cpu().numpy()})
 
-        # decode the input tokens without concatenating the decoded tokens into a single string
-        # decoded_input_tokens.shape: (1, seq_len)
-        decoded_input_tokens = np.asarray(self.tokenizer.batch_decode(input_ids.unsqueeze(-1)[0]))[np.newaxis, :]
         # f_mu.shape: (1, num_classes); f_var.shape: (1, num_classes, num_classes); gt_classes.shape: (1,)
-        f_mu = f_mu.detach().cpu().numpy()
-        f_var = f_var.detach().cpu().numpy()
-        gt_classes = classes.cpu().numpy()
-        entropy = entropy.detach().cpu().numpy()
+        if convert_to_np:
+            for k, v in attribution_dict.items():
+                attribution_dict[k] = v.cpu().numpy()
+            f_mu = f_mu.detach().cpu().numpy()
+            f_var = f_var.detach().cpu().numpy()
+            gt_classes = gt_classes.cpu().numpy()
+            entropy = entropy.detach().cpu().numpy()
         raw_result = RawResult(
             input_tokens=decoded_input_tokens,
             input_prompts=prompts,
@@ -169,6 +190,95 @@ class UncertaintyAttributer:
             entropy=entropy)
 
         return raw_result
+
+
+class UncertaintyOptimizer(UncertaintyAttributer):
+    """
+    Aims to optimmize the uncertainty using sgd wrt to a specific token in the input sequence,
+    which was prepended for this purpose. Also calculates the accuracy of the predictions in the dataset."""
+
+    def __init__(
+            self,
+            cfg,
+            tokenizer,
+            model,
+            factors,
+            target_ids,
+            device,
+            optim: torch.optim.Optimizer = torch.optim.Adam,
+            lr=1e-4,
+            steps=10,
+            maximize=False,
+            strategy='prepend'):
+        super().__init__(cfg, tokenizer, model, factors, target_ids, device, retain_grad=True)
+        self.optim = optim
+        self.lr = lr
+        self.steps = steps
+        self.sign = -1 if maximize else 1
+        # strategy has to be prepend, bos, eos, or append
+        self.strategy = strategy
+        self.correct_counter = 0
+        self.total_counter = 0
+
+    def _apply_strategy(self, sample: str) -> Tuple[str, int]:
+        """
+        applies changes to prompt according to strategy, as well as indicating the target token.
+        """
+        if self.strategy == 'prepend':
+            sample = f'<s> {sample}'
+            target_token = 1
+        elif self.strategy == 'append':
+            sample = f'{sample} </s>'
+            target_token = -2
+        elif self.strategy == 'bos':
+            target_token = 0
+        elif self.strategy == 'eos':
+            target_token = -1
+        else:
+            raise ValueError('strategy has to be prepend, bos, eos, or append')
+
+        return sample, target_token
+
+    def do_attribution(self, data_loader: DataLoader) -> None:
+        n_labels = len(self.target_ids)
+        for batch_idx, batch in alive_it(enumerate(data_loader), total=len(data_loader)):
+            prompts, classes, targets = batch
+            prompts, target_token = self._apply_strategy(prompts[0])
+            input_ids = self.tokenizer(prompts, **self.cfg.tokenizer_run_cfg).input_ids.to(self.device)
+            input_embed = self.model.base_model.model.model.embed_tokens(input_ids)
+            target_emb = torch.nn.Parameter(input_embed[0, target_token, :].clone().detach())
+            optim = self.optim([target_emb], lr=self.lr)
+
+            for _ in range(self.steps):
+                optim.zero_grad()
+                input_embed = input_embed.detach().clone()
+                input_embed[0, target_token, :] = target_emb.detach().clone()
+                input_embed.requires_grad = True
+                raw_result = self.get_attribution_of_sample(
+                    inputs_embeds=input_embed, n_labels=len(self.target_ids), convert_to_np=False)
+                grad = raw_result.attributions['embed_tokens'].to(dtype=input_embed.dtype)
+                target_emb.requires_grad = True
+                target_emb.grad = grad[0, target_token, :]
+                loss = self.sign * raw_result.entropy
+                loss.backward()
+                optim.step()
+
+            raw_result = self.get_attribution_of_sample(
+                inputs_embeds=input_embed, n_labels=n_labels, gt_classes=classes)
+            self._on_sample_attribution_end(batch_idx, raw_result)
+        self._on_final()
+
+    def _on_sample_attribution_end(self, batch_idx: int, raw_result: RawResult) -> None:
+        """
+        count if correct
+        """
+        self.total_counter += 1
+        # import pdb; pdb.set_trace()
+        if raw_result.logits.argmax().item() == raw_result.gt_classes.item():
+            self.correct_counter += 1
+
+    def _on_final(self):
+        print(f'Accuracy: {self.correct_counter/self.total_counter}')
 
 
 class VisualizedUA(UncertaintyAttributer):
@@ -216,10 +326,10 @@ class PerAnswerUA(UncertaintyAttributer):
             target_ids: list[int],
             device: torch.device,
             work_dir: str,
-            hidden_state: int = 0) -> None:
+            hs_idx: int = 0) -> None:
         super().__init__(cfg, tokenizer, model, kfac_factors, target_ids, device)
         self.df = {
-            'batch_idx': [],
+            'idx': [],
             'ua_question': [],
             'ua_correct_answer': [],
             'ua_mean_wrong_answers': [],
@@ -229,9 +339,7 @@ class PerAnswerUA(UncertaintyAttributer):
         }
 
         self.work_dir = work_dir
-        # TODO Question: this is ambiguous. hidden_states often refer to the hidden states tensor.
-        #  But it seem to mean the index of something.
-        self.hidden_state = hidden_state
+        self.hs_idx = hs_idx
 
     def _on_sample_attribution_end(self, batch_idx: int, raw_result: RawResult) -> None:
         ua = raw_result.attributions['embed_tokens']
@@ -239,16 +347,15 @@ class PerAnswerUA(UncertaintyAttributer):
         prompts = raw_result.input_prompts
         answer_idx = self.get_answer_idx(prompts[0])
 
-        ua_question = ua[..., self.hidden_state, :answer_idx[0]].sum()
+        ua_question = ua[..., self.hs_idx, :answer_idx[0]].sum()
 
         predicted_class = raw_result.logits.argmax(axis=-1)
         predicted_idx = answer_idx[predicted_class[0].item()]
-        predicted_ua = ua[..., self.hidden_state, predicted_idx].sum()
-
+        predicted_ua = ua[..., self.hs_idx, predicted_idx].sum()
         correct_idx = answer_idx[correct_class[0].item()]
-        correct_ua = ua[..., self.hidden_state, correct_idx].sum()
+        correct_ua = ua[..., self.hs_idx, correct_idx].sum()
 
-        mean_ua_wrong_answers = (ua[..., self.hidden_state, :].sum() - ua_question - correct_ua) / (len(answer_idx) - 1)
+        mean_ua_wrong_answers = (ua[..., self.hs_idx, :].sum() - ua_question - correct_ua) / (len(answer_idx) - 1)
 
         self.df['idx'].append(batch_idx)
         self.df['ua_question'].append(ua_question)
@@ -263,16 +370,23 @@ class PerAnswerUA(UncertaintyAttributer):
         df.to_csv(osp.join(self.work_dir, 'attribution_results.csv'))
 
     @staticmethod
-    def get_answer_idx(prompt: str) -> list[int]:
-        """provides the index of the first token of each answer choice in the prompt -> A), B), C), D)"""
-        # TODO Question: What if the prompt questions contain A, B, C,D. E.g.
-        #  Question: A laptop is a type of computer. ... A), B).
-        # if A) B) C) D) are not in the prompt, use 1) 2) 3) 4) instead
-        if 'D)' in prompt:
-            return [prompt.index('A)'), prompt.index('B)'), prompt.index('C)'), prompt.index('D)')]
-        elif 'C)' in prompt:
-            return [prompt.index('A)'), prompt.index('B)'), prompt.index('C)')]
-        if '4)' in prompt:
-            return [prompt.index('1)'), prompt.index('2)'), prompt.index('3)'), prompt.index('4)')]
-        else:
-            return [prompt.index('1)'), prompt.index('2)'), prompt.index('3)')]
+    def get_answer_idx(prompt: str) -> List[int]:
+        """Provides the index of the first token of each answer choice in the prompt -> A), B), C), D)
+        or 1), 2), 3), 4) if the alphabetic identifiers are not found."""
+
+        # Define regex patterns for alphabetic and numeric answer choices
+        alpha_pattern = r'\b[A-D]\)'
+        numeric_pattern = r'\b[1-4]\)'
+
+        # Search for alphabetic answer choice identifiers first
+        matches = list(re.finditer(alpha_pattern, prompt))
+        if matches:
+            return [match.start() for match in matches]
+
+        # If no alphabetic identifiers, search for numeric identifiers
+        matches = list(re.finditer(numeric_pattern, prompt))
+        if matches:
+            return [match.start() for match in matches]
+
+        # Return an empty list if no identifiers are found
+        return []

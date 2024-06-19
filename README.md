@@ -1,4 +1,7 @@
 # LLM Uncertainty Attribution
+This repository provides tools to calculate the uncertainty of a large language model (LLM) using the entropy of its output. It attributes this uncertainty to the hidden states as well as the input. Additionally, it includes features for visualizing the uncertainty and offers two methods to mitigate it.
+
+![grafik](https://github.com/finitearth/llm-ua/assets/19229952/39eadabd-2f3e-4c1b-89ad-8ed2355d310d)
 
 ## Installation
 1. Install `torch` following the documentations of `PyTorch`.
@@ -16,3 +19,5 @@ Install pre-commit hooks via `pre-commit install`.
 The app requires `Flask`, which is already listed in `"dev"` feature in `setup.cfg`.
 `python tools/app.py /path/to/vis_attributions/`
 and then open `http://127.0.0.1:5000` in your browser.
+
+
